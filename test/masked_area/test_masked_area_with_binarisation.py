@@ -109,12 +109,12 @@ def calculate_detailed_metrics_per_image(pred_binary, target, mask):
     pred_binary = pred_binary.bool()
     target = target.bool()
 
-    evaluation_mask = (mask == 0).bool()
+    masked_region = (mask == 0).bool()
 
-    tp = (pred_binary & target & evaluation_mask).sum().item()
-    tn = (~pred_binary & ~target & evaluation_mask).sum().item()
-    fp = (pred_binary & ~target & evaluation_mask).sum().item()
-    fn = (~pred_binary & target & evaluation_mask).sum().item()
+    tp = (pred_binary & target & masked_region).sum().item()
+    tn = (~pred_binary & ~target & masked_region).sum().item()
+    fp = (pred_binary & ~target & masked_region).sum().item()
+    fn = (~pred_binary & target & masked_region).sum().item()
 
     return {"tp": tp, "tn": tn, "fp": fp, "fn": fn}
 

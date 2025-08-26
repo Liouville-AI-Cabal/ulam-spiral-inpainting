@@ -211,7 +211,7 @@ def run_training_pipeline(model, train_loader, val_loader, optimizer, scheduler,
             patience_counter += 1
             if patience_counter >= PATIENCE:
                 print(f"   -> Early stopping in epoch {epoch+1}")
-                # break  # Uncomment to stop training early
+                break  # Comment to stop training early
     print(f"\nTraining completed for '{model_name}'. Best model has been saved.")
 
 # Main

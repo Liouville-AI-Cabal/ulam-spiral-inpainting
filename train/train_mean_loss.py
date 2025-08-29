@@ -13,6 +13,8 @@ import segmentation_models_pytorch as smp
 from skimage.metrics import structural_similarity as ssim
 from PIL import Image
 
+import wandb
+
 Image.MAX_IMAGE_PIXELS = None
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
@@ -132,12 +134,13 @@ def train_epoch(dataloader, model, optimizer, loss_fn):
     return total_loss / len(dataloader)
 
 # Validation
-def validate_model(dataloader, model, model_name, loss_fn, eval_loss_fn):
+def validate_model(dataloader, model, model_name, epoch, loss_fn, eval_loss_fn):
     model.eval()
     total_loss = total_acc = total_ssim = total_eval_loss = 0
     total_mcacc = 0
     save_dir = VISUALS_DIR / f"{model_name}_val_samples"
     os.makedirs(save_dir, exist_ok=True)
+    wandb_image = None
     with torch.no_grad():
         for i, (data, target) in enumerate(dataloader):
             data, target = data.to(DEVICE), target.to(DEVICE)
@@ -170,19 +173,19 @@ def validate_model(dataloader, model, model_name, loss_fn, eval_loss_fn):
                 )
 
             if i == 0:
-                output_bin = preds_bin
-                target_bin = target
+                img_path = save_dir / f"sample_epoch_{epoch+1}.png"
                 save_image(
-                    torch.cat([target_bin[0], masked_input[0], output_bin[0]], dim=2),
-                    save_dir / f"sample_epoch.png"
+                    torch.cat([target[0], masked_input[0], preds_bin[0]], dim=2),
+                    img_path
                 )
+                wandb_image = wandb.Image(str(img_path), caption=f"Epoch {epoch+1}")
 
     avg_loss = total_loss / len(dataloader)
     avg_eval_loss = total_eval_loss / len(dataloader)
     avg_acc = total_acc / len(dataloader.dataset)
     avg_mcacc = total_mcacc / len(dataloader.dataset)
     avg_ssim = total_ssim / len(dataloader.dataset)
-    return avg_loss, avg_eval_loss, avg_acc, avg_mcacc, avg_ssim
+    return avg_loss, avg_eval_loss, avg_acc, avg_mcacc, avg_ssim, wandb_image
 
 # Training Loop
 def run_training_pipeline(model, train_loader, val_loader, optimizer, scheduler, model_name, loss_fn, eval_loss_fn):
@@ -190,16 +193,28 @@ def run_training_pipeline(model, train_loader, val_loader, optimizer, scheduler,
     patience_counter = 0
     for epoch in range(EPOCHS):
         train_loss = train_epoch(train_loader, model, optimizer, loss_fn)
-        val_loss, val_eval_loss, val_acc, val_mcacc, val_ssim = validate_model(val_loader, model, model_name, loss_fn, eval_loss_fn)
+        val_loss, val_eval_loss, val_acc, val_mcacc, val_ssim, val_image = validate_model(val_loader, model, model_name, epoch, loss_fn, eval_loss_fn)
         scheduler.step(val_loss)
 
         print(f"Epoch {epoch+1}/{EPOCHS} | "
               f"Train Loss: {train_loss:.4f} | "
               f"Val Loss: {val_loss:.4f} | "
-              f"Val Loss: {val_eval_loss:.4f} | "
+              f"Val Eval Loss: {val_eval_loss:.4f} | "
               f"Val Acc: {val_acc:.4f} | "
               f"mCAcc: {val_mcacc*100:.2f}% | "
               f"Val SSIM: {val_ssim:.4f}")
+
+        wandb.log({
+            "epoch": epoch + 1,
+            "train_loss": train_loss,
+            "val_loss": val_loss,
+            "val_eval_loss": val_eval_loss,
+            "val_accuracy": val_acc,
+            "val_mCAcc": val_mcacc * 100,
+            "val_ssim": val_ssim,
+            "learning_rate": optimizer.param_groups[0]['lr'],
+            "validation_sample": val_image
+        })
 
         if val_loss < best_val_loss:
             best_val_loss = val_loss
@@ -207,6 +222,10 @@ def run_training_pipeline(model, train_loader, val_loader, optimizer, scheduler,
             save_path = MODEL_SAVE_PATH_TEMPLATE.format(model_name=model_name)
             torch.save(model.state_dict(), save_path)
             print(f"   -> Best model saved in '{save_path}'")
+
+            artifact = wandb.Artifact(name=model_name, type="model")
+            artifact.add_file(local_path=save_path)
+            wandb.log_artifact(artifact, aliases=["best"])
         else:
             patience_counter += 1
             if patience_counter >= PATIENCE:
@@ -225,7 +244,25 @@ if __name__ == "__main__":
     
     # Change this to 25,000,000; 50,000,000; 100,000,000; 200,000,000
     size_str = "200,000,000"
+    
+    config = {
+        "dataset_size": size_str,
+        "epochs": EPOCHS,
+        "patience": PATIENCE,
+        "batch_size": BATCH_SIZE,
+        "learning_rate": LR,
+        "architecture": "U-Net with ResNet34",
+        "loss_function": "CombinedLoss (SoftMCA + BCE, alpha=1.0, beta=0.5)"
+    }
 
+    model_name = f"model_{size_str.replace(',', '')}"
+    
+    wandb.init(
+        project="prime-spiral-inpainting",
+        config=config,
+        name=f"train_{model_name}"
+    )
+    
     print(f"\n{'='*20} Starting training for {size_str} {'='*20}")
     model = create_unet()
     optimizer = torch.optim.Adam(model.parameters(), lr=LR)
@@ -239,7 +276,8 @@ if __name__ == "__main__":
     if len(train_data) == 0 or len(val_data) == 0:
         print(f"Data can't be found for size {size_str}. Skipping")
     else:
-        model_name = f"model_{size_str.split(',')[0]}m"
+        wandb.watch(model, log="all", log_freq=100)
+
         run_training_pipeline(
             model=model,
             train_loader=train_loader,
@@ -251,3 +289,5 @@ if __name__ == "__main__":
             eval_loss_fn=eval_loss_fn
         )
     print("\nSingle-size training completed")
+
+    wandb.finish()

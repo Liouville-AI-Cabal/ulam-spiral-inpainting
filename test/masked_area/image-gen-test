@@ -1,0 +1,414 @@
+import os
+import argparse
+from pathlib import Path
+import torch
+import torch.nn as nn
+from torch.utils.data import Dataset, DataLoader
+from torchvision import transforms
+from PIL import Image, ImageDraw, ImageFont
+import segmentation_models_pytorch as smp
+import numpy as np
+from sklearn.metrics import confusion_matrix
+
+DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+Image.MAX_IMAGE_PIXELS = None
+
+class SimpleImageDataset(Dataset):
+    def __init__(self, root_dir, transform=None, size_filter=None):
+        self.root_dir = Path(root_dir)
+        self.transform = transform
+        self.image_files = list(self.root_dir.glob("*.png"))
+        if size_filter:
+            self.image_files = [f for f in self.image_files if size_filter in f.name]
+    
+    def __len__(self):
+        return len(self.image_files)
+    
+    def __getitem__(self, idx):
+        img_path = self.image_files[idx]
+        original_name = img_path.name
+        img = Image.open(img_path).convert("L")
+        if self.transform:
+            img = self.transform(img)
+        return img, img.clone(), original_name
+
+def create_unet():
+    model = smp.Unet(
+        encoder_name="resnet34",
+        encoder_weights="imagenet",
+        in_channels=1,
+        classes=1,
+        activation="sigmoid"
+    ).to(DEVICE)
+    return model
+
+class MeanClassAccuracyLoss(nn.Module):
+    def __init__(self):
+        super().__init__()
+    def forward(self, preds, targets):
+        preds_bin = (preds > 0.5).float()
+        targets = (targets > 0.5).float()
+        tp = ((preds_bin == 1) & (targets == 1)).sum().float()
+        tn = ((preds_bin == 0) & (targets == 0)).sum().float()
+        fp = ((preds_bin == 1) & (targets == 0)).sum().float()
+        fn = ((preds_bin == 0) & (targets == 1)).sum().float()
+        acc_class1 = tp / (tp + fn + 1e-7)
+        acc_class0 = tn / (tn + fp + 1e-7)
+        return 1.0 - ((acc_class1 + acc_class0) / 2.0)
+
+def calculate_detailed_metrics(pred_binary, target):
+    pred_binary = pred_binary.bool()
+    target = target.bool()
+
+    tp = (pred_binary & target).sum().item()
+    tn = (~pred_binary & ~target).sum().item()
+    fp = (pred_binary & ~target).sum().item()
+    fn = (~pred_binary & target).sum().item()
+
+    precision_1 = tp / (tp + fp) if (tp + fp) > 0 else 0
+    recall_1 = tp / (tp + fn) if (tp + fn) > 0 else 0
+    f1_1 = 2 * (precision_1 * recall_1) / (precision_1 + recall_1) if (precision_1 + recall_1) > 0 else 0
+
+    precision_0 = tn / (tn + fn) if (tn + fn) > 0 else 0
+    recall_0 = tn / (tn + fp) if (tn + fp) > 0 else 0
+    f1_0 = 2 * (precision_0 * recall_0) / (precision_0 + recall_0) if (precision_0 + recall_0) > 0 else 0
+    
+    accuracy = (tp + tn) / (tp + tn + fp + fn) if (tp + tn + fp + fn) > 0 else 0
+    
+    balanced_acc = (recall_0 + recall_1) / 2.0 if (recall_0 + recall_1) > 0 else 0
+    
+    total_pixels = tp + tn + fp + fn
+    class_0_percent = ((tn + fp) / total_pixels) * 100 if total_pixels > 0 else 0
+    class_1_percent = ((tp + fn) / total_pixels) * 100 if total_pixels > 0 else 0
+
+    metrics = {
+        "accuracy": accuracy * 100,
+        "balanced_acc": balanced_acc * 100,
+        "conf_matrix": {"tp": tp, "tn": tn, "fp": fp, "fn": fn},
+        "class_1": {
+            "precision": precision_1 * 100,
+            "recall": recall_1 * 100,
+            "f1": f1_1 * 100,
+            "percent": class_1_percent
+        },
+        "class_0": {
+            "precision": precision_0 * 100,
+            "recall": recall_0 * 100,
+            "f1": f1_0 * 100,
+            "percent": class_0_percent
+        },
+    }
+    return metrics
+
+def create_error_map(pred_binary, target):
+    pred_np = pred_binary.squeeze().cpu().numpy()
+    target_np = target.squeeze().cpu().numpy()
+
+    h, w = target_np.shape
+    error_map_rgb = np.zeros((h, w, 3), dtype=np.uint8)
+
+    error_map_rgb[(pred_np == 0) & (target_np == 0)] = [20, 20, 20]
+    error_map_rgb[(pred_np == 1) & (target_np == 1)] = [255, 255, 255]
+    error_map_rgb[(pred_np == 1) & (target_np == 0)] = [255, 0, 0]
+    error_map_rgb[(pred_np == 0) & (target_np == 1)] = [0, 0, 255]
+    
+    return Image.fromarray(error_map_rgb)
+
+def save_comparison_image(images, metrics, save_path):
+    titles = ["Masked Input", "Inpainting Result", "Error Map", "Original Image"]
+    width, height = images[0].size
+    
+    panel_width = width
+    panels_total_width = panel_width * len(images)
+    sidebar_width = 350
+    title_height = 30
+
+    try:
+        font_size = 8
+        font = ImageFont.truetype("arial.ttf", font_size)
+        font_bold = ImageFont.truetype("arialbd.ttf", font_size)
+    except IOError:
+        font = ImageFont.load_default()
+        font_bold = font
+
+    estimated_lines = 38
+    line_height = font_size + 4
+    needed_sidebar_height = estimated_lines * line_height + 40
+
+    total_height = max(height + title_height, needed_sidebar_height)
+
+    canvas = Image.new('RGB', (panels_total_width + sidebar_width, total_height), (0, 0, 0))
+    draw = ImageDraw.Draw(canvas)
+
+    for i, img in enumerate(images):
+        if img.mode == 'L':
+            img = img.convert('RGB')
+        canvas.paste(img, (i * panel_width, title_height))
+        text_bbox = draw.textbbox((0,0), titles[i], font=font_bold)
+        text_w = text_bbox[2] - text_bbox[0]
+        draw.text((i * panel_width + (panel_width - text_w) // 2, 5), titles[i], font=font_bold, fill=(255, 255, 255))
+
+    sidebar_x0 = panels_total_width
+    sidebar_x1 = panels_total_width + sidebar_width
+    draw.rectangle([sidebar_x0, 0, sidebar_x1, total_height], fill=(15, 15, 15))
+
+    x_pos, y_pos = panels_total_width + 15, title_height
+    draw.text((x_pos, y_pos), "Inpainting Performance Analysis", font=font_bold, fill=(255,255,0))
+    y_pos += 25
+    draw.line([(x_pos-5, y_pos-5), (sidebar_x1-10, y_pos-5)], fill=(80,80,80), width=1)
+
+    draw.text((x_pos, y_pos), "Pixel Class Distribution:", font=font_bold, fill=(255,255,255))
+    y_pos += 18
+    draw.text((x_pos, y_pos), f"  Black (0): {metrics['class_0']['percent']:.1f}%", font=font, fill=(200,200,200))
+    y_pos += 18
+    draw.text((x_pos, y_pos), f"  White (1): {metrics['class_1']['percent']:.1f}%", font=font, fill=(200,200,200))
+    y_pos += 25
+
+    draw.text((x_pos, y_pos), f"Overall Accuracy: {metrics['accuracy']:.2f}%", font=font_bold, fill=(255,255,255))
+    y_pos += 18
+    draw.text((x_pos, y_pos), f"Balanced Accuracy (mCAcc): {metrics['balanced_acc']:.2f}%", font=font_bold, fill=(255,255,255))
+    y_pos += 25
+
+    draw.text((x_pos, y_pos), "Black Pixels (0)", font=font_bold, fill=(255,255,255))
+    y_pos += 18
+    draw.text((x_pos, y_pos), f"  Precision: {metrics['class_0']['precision']:.2f}%", font=font, fill=(200,200,200))
+    y_pos += 18
+    draw.text((x_pos, y_pos), f"  Recall: {metrics['class_0']['recall']:.2f}%", font=font, fill=(200,200,200))
+    y_pos += 18
+    draw.text((x_pos, y_pos), f"  F1-Score: {metrics['class_0']['f1']:.2f}%", font=font, fill=(200,200,200))
+    y_pos += 25
+
+    draw.text((x_pos, y_pos), "White Pixels (1)", font=font_bold, fill=(255,255,255))
+    y_pos += 18
+    draw.text((x_pos, y_pos), f"  Precision: {metrics['class_1']['precision']:.2f}%", font=font, fill=(200,200,200))
+    y_pos += 18
+    draw.text((x_pos, y_pos), f"  Recall: {metrics['class_1']['recall']:.2f}%", font=font, fill=(200,200,200))
+    y_pos += 18
+    draw.text((x_pos, y_pos), f"  F1-Score: {metrics['class_1']['f1']:.2f}%", font=font, fill=(200,200,200))
+    y_pos += 25
+
+    cm = metrics['conf_matrix']
+    draw.text((x_pos, y_pos), "Confusion Matrix", font=font_bold, fill=(255,255,255))
+    y_pos += 18
+    draw.text((x_pos, y_pos), f"  TN: {cm['tn']:,}", font=font, fill=(200,200,200))
+    y_pos += 18
+    draw.text((x_pos, y_pos), f"  FP: {cm['fp']:,}", font=font, fill=(200,200,200))
+    y_pos += 18
+    draw.text((x_pos, y_pos), f"  FN: {cm['fn']:,}", font=font, fill=(200,200,200))
+    y_pos += 18
+    draw.text((x_pos, y_pos), f"  TP: {cm['tp']:,}", font=font, fill=(200,200,200))
+
+    y_pos += 25
+    draw.text((x_pos, y_pos), "Error Map Legend:", font=font_bold, fill=(255,255,255))
+    y_pos += 18
+    draw.rectangle([(x_pos, y_pos), (x_pos+12, y_pos+12)], fill=(20,20,20))
+    draw.text((x_pos+18, y_pos), "TN (Correct Black)", font=font, fill=(200,200,200))
+    y_pos += 18
+    draw.rectangle([(x_pos, y_pos), (x_pos+12, y_pos+12)], fill=(255,255,255))
+    draw.text((x_pos+18, y_pos), "TP (Correct White)", font=font, fill=(200,200,200))
+    y_pos += 18
+    draw.rectangle([(x_pos, y_pos), (x_pos+12, y_pos+12)], fill=(255,0,0))
+    draw.text((x_pos+18, y_pos), "FP (Wrong White)", font=font, fill=(200,200,200))
+    y_pos += 18
+    draw.rectangle([(x_pos, y_pos), (x_pos+12, y_pos+12)], fill=(0,0,255))
+    draw.text((x_pos+18, y_pos), "FN (Wrong Black)", font=font, fill=(200,200,200))
+
+    canvas.save(save_path)
+
+def generate_mask(batch_size, channels, height, width, mask_ratio=0.2, seed=None):
+    if seed is not None:
+        torch.manual_seed(seed)
+    mask = (torch.rand(batch_size, channels, height, width) > (1 - mask_ratio)).float().to(DEVICE)
+    if seed is not None:
+        torch.seed()
+    return mask
+
+def test_model(model, dataloader, model_name="", mask_ratio=0.2):
+    model.eval()
+    
+    save_dir = Path("visual_samples") / f"{model_name}_TEST_RESULTS"
+    os.makedirs(save_dir, exist_ok=True)
+    print(f"Test saved in: {save_dir}")
+    
+    mca_evaluator = MeanClassAccuracyLoss()
+    
+    all_preds = []
+    all_targets = []
+    
+    metrics_file = save_dir / f"detailed_metrics_{model_name}.txt"
+    with open(metrics_file, 'w') as f:
+        f.write(f"Detailed Metrics for Model: {model_name}\n")
+        f.write("="*50 + "\n\n")
+        f.write(f"Mask ratio: {mask_ratio}\n\n")
+
+    with torch.no_grad():
+        for i, (data, target, original_names) in enumerate(dataloader):
+            data, target = data.to(DEVICE), target.to(DEVICE)
+            
+            mask = generate_mask(*data.shape, mask_ratio=mask_ratio, seed=i)
+            masked_input = data * mask
+            
+            output = model(masked_input)
+            output_binary = (output > 0.5).float()
+            
+            mca_loss = mca_evaluator(output, target)
+            
+            for j in range(data.size(0)):
+                pred_flat = output_binary[j].cpu().numpy().flatten()
+                target_flat = target[j].cpu().numpy().flatten()
+                all_preds.extend(pred_flat)
+                all_targets.extend(target_flat)
+                
+                metrics = calculate_detailed_metrics(output_binary[j], target[j])
+                
+                with open(metrics_file, 'a') as f:
+                    f.write(f"Image: {original_names[j]}\n")
+                    f.write(f"  Class 0 (Black) %: {metrics['class_0']['percent']:.2f}%\n")
+                    f.write(f"  Class 1 (White) %: {metrics['class_1']['percent']:.2f}%\n")
+                    f.write(f"  Overall Accuracy: {metrics['accuracy']:.2f}%\n")
+                    f.write(f"  Balanced Accuracy (mCAcc): {metrics['balanced_acc']:.2f}%\n")
+                    f.write(f"  Class 0 Precision: {metrics['class_0']['precision']:.2f}%\n")
+                    f.write(f"  Class 0 Recall: {metrics['class_0']['recall']:.2f}%\n")
+                    f.write(f"  Class 1 Precision: {metrics['class_1']['precision']:.2f}%\n")
+                    f.write(f"  Class 1 Recall: {metrics['class_1']['recall']:.2f}%\n")
+                    f.write("\n")
+
+            if i < 5:
+                for j in range(min(data.size(0), 2)):
+                    img_masked = masked_input[j]
+                    img_result = output_binary[j]
+                    img_original = target[j]
+                    
+                    error_map = create_error_map(img_result, img_original)
+                    
+                    single_image_metrics = calculate_detailed_metrics(img_result, img_original)
+                    
+                    to_pil = transforms.ToPILImage()
+                    images_to_save = [
+                        to_pil(img_masked.cpu()),
+                        to_pil(img_result.cpu()),
+                        error_map,
+                        to_pil(img_original.cpu())
+                    ]
+                    
+                    base_name = Path(original_names[j]).stem
+                    save_path = save_dir / f"comparison_{model_name}_{base_name}.png"
+                    
+                    save_comparison_image(images_to_save, single_image_metrics, save_path)
+                    print(f"  -> Saved: {save_path.name}")
+
+    all_preds = np.array(all_preds, dtype=np.int32)
+    all_targets = np.array(all_targets, dtype=np.int32)
+    
+    cm = confusion_matrix(all_targets, all_preds, labels=[0, 1])
+    tn, fp, fn, tp = cm.ravel()
+    
+    total_pixels = len(all_targets)
+    class_0_count = np.sum(all_targets == 0)
+    class_1_count = np.sum(all_targets == 1)
+    class_0_percent = (class_0_count / total_pixels) * 100
+    class_1_percent = (class_1_count / total_pixels) * 100
+    
+    accuracy = (tp + tn) / (tp + tn + fp + fn) * 100
+    
+    precision_1 = tp / (tp + fp) * 100 if (tp + fp) > 0 else 0
+    recall_1 = tp / (tp + fn) * 100 if (tp + fn) > 0 else 0
+    f1_1 = 2 * (precision_1 * recall_1) / (precision_1 + recall_1) if (precision_1 + recall_1) > 0 else 0
+    
+    precision_0 = tn / (tn + fn) * 100 if (tn + fn) > 0 else 0
+    recall_0 = tn / (tn + fp) * 100 if (tn + fp) > 0 else 0
+    f1_0 = 2 * (precision_0 * recall_0) / (precision_0 + recall_0) if (precision_0 + recall_0) > 0 else 0
+    
+    balanced_acc = ((recall_0 + recall_1) / 2)
+    
+    with open(metrics_file, 'a') as f:
+        f.write("\n" + "="*50 + "\n")
+        f.write("OVERALL DATASET METRICS\n")
+        f.write("="*50 + "\n\n")
+        f.write(f"Class Distribution:\n")
+        f.write(f"  - Class 0 (Black): {class_0_count:,} pixels ({class_0_percent:.2f}%)\n")
+        f.write(f"  - Class 1 (White): {class_1_count:,} pixels ({class_1_percent:.2f}%)\n\n")
+        f.write(f"Confusion Matrix:\n")
+        f.write(f"  - True Negatives (TN): {tn:,}\n")
+        f.write(f"  - False Positives (FP): {fp:,}\n")
+        f.write(f"  - False Negatives (FN): {fn:,}\n")
+        f.write(f"  - True Positives (TP): {tp:,}\n\n")
+        f.write(f"Overall Accuracy: {accuracy:.2f}%\n")
+        f.write(f"Accuracy to Original Image: {balanced_acc:.2f}%\n\n")
+        f.write(f"Class 0 (Black) Metrics:\n")
+        f.write(f"  - Precision: {precision_0:.2f}%\n")
+        f.write(f"  - Recall: {recall_0:.2f}%\n")
+        f.write(f"  - F1-Score: {f1_0:.2f}%\n\n")
+        f.write(f"Class 1 (White) Metrics:\n")
+        f.write(f"  - Precision: {precision_1:.2f}%\n")
+        f.write(f"  - Recall: {recall_1:.2f}%\n")
+        f.write(f"  - F1-Score: {f1_1:.2f}%\n")
+
+    print("\n" + "="*50)
+    print(f"FINAL RESULTS for {model_name}")
+    print("="*50)
+    print(f"Total pixels evaluated: {total_pixels:,}")
+    print(f"Class distribution:")
+    print(f"  - Class 0 (Black): {class_0_percent:.2f}%")
+    print(f"  - Class 1 (White): {class_1_percent:.2f}%")
+    print("\nMetrics:")
+    print(f"  Overall Accuracy: {accuracy:.2f}%")
+    print(f"  Accuracy to Original Image: {balanced_acc:.2f}%")
+    print("\nClass 0 (Black) Metrics:")
+    print(f"  - Precision: {precision_0:.2f}%")
+    print(f"  - Recall: {recall_0:.2f}%")
+    print(f"  - F1-Score: {f1_0:.2f}%")
+    print("\nClass 1 (White) Metrics:")
+    print(f"  - Precision: {precision_1:.2f}%")
+    print(f"  - Recall: {recall_1:.2f}%")
+    print(f"  - F1-Score: {f1_1:.2f}%")
+    print("\nConfusion Matrix:")
+    print(f"  - TN: {tn:,}, FP: {fp:,}")
+    print(f"  - FN: {fn:,}, TP: {tp:,}")
+    print("="*50)
+    print(f"Detailed metrics saved to: {metrics_file}")
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser(description="Script to test inpainting model.")
+    parser.add_argument("--model-path", type=str, required=True, help="Path to trained model .pth file")
+    parser.add_argument("--test-dir", type=str, default="prime_patches/test", help="Directory containing test images")
+    parser.add_argument("--size-filter", type=str, required=True, help="Filter for image size (e.g., '25,000,000')")
+    parser.add_argument("--batch-size", type=int, default=4, help="Batch size for testing")
+    parser.add_argument("--mask-ratio", type=float, default=0.2, help="Ratio of pixels to mask (0-1)")
+    args = parser.parse_args()
+
+    print(f"Using device: {DEVICE}")
+    print(f"Model: {args.model_path}")
+    print(f"Mask ratio: {args.mask_ratio}")
+
+    model = create_unet()
+    model.load_state_dict(torch.load(args.model_path, map_location=DEVICE))
+    model.eval()
+
+    transform = transforms.Compose([
+        transforms.Resize((256, 256)),
+        transforms.ToTensor()
+    ])
+
+    test_dataset = SimpleImageDataset(
+        root_dir=args.test_dir,
+        transform=transform,
+        size_filter=args.size_filter
+    )
+    
+    if len(test_dataset) == 0:
+        print(f"❌ ERROR: No test data found in '{args.test_dir}' with filter '{args.size_filter}'.")
+        print("Make sure path and filter is correct.")
+    else:
+        print(f"✅ Found {len(test_dataset)} test images with filter '{args.size_filter}'.")
+        test_loader = DataLoader(test_dataset, batch_size=args.batch_size, shuffle=False)
+        
+        model_name_from_path = Path(args.model_path).stem
+        
+        test_model(
+            model=model, 
+            dataloader=test_loader, 
+            model_name=f"{model_name_from_path}_on_{args.size_filter}_data",
+            mask_ratio=args.mask_ratio
+        )
+        print("Test completed.")
